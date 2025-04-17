@@ -37,3 +37,4 @@ embedded-sdmmc = { version = "0.8.1", default-features = false, features = [
   "defmt-log",
 ] }
 embedded-hal-bus = "0.3.0"
+rand = { version = "0.8.5", default-features = false }
