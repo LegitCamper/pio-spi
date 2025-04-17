@@ -59,7 +59,12 @@ async fn main(_spawner: Spawner) {
 
     // spi_read_files(spi, cs);
 
-    manual_sd_init(spi, cs).await;
+    // manual_sd_init(spi, cs).await;
+
+    let mut config = spi::Config::default();
+    config.frequency = 32_000_000;
+    spi.set_config(&config);
+    spi_loopback_test(&mut spi, 100_000);
 
     info!("Done!!!");
 
@@ -170,10 +175,13 @@ fn spi_read_files<'d, PIO: pio::Instance, const SM: usize>(
         .unwrap();
 }
 
-fn spi_loopback_test<'d, PIO: pio::Instance, const SM: usize>(spi: &mut PioSpi<'d, PIO, SM>) {
+fn spi_loopback_test<'d, PIO: pio::Instance, const SM: usize>(
+    spi: &mut PioSpi<'d, PIO, SM>,
+    tests: u32,
+) {
     let mut rng = RoscRng;
 
-    for i in 0..100 {
+    for i in 0..tests {
         let byte = rng.r#gen::<u8>();
         spi.write_byte(byte);
         let received = spi.read_byte();
@@ -183,8 +191,6 @@ fn spi_loopback_test<'d, PIO: pio::Instance, const SM: usize>(spi: &mut PioSpi<'
                 i, byte, received
             );
             break;
-        } else {
-            info!("OK @ {}: {:02X}", i, byte);
         }
     }
 }
