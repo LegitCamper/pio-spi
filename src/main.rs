@@ -15,7 +15,7 @@ use embassy_rp::pio::{
     self, Common, Direction, Instance, InterruptHandler, LoadedProgram, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
-use embassy_rp::spi::{self, Error, Phase, Polarity};
+use embassy_rp::spi::{self, Error, Phase, Polarity, Spi};
 use embassy_time::Timer;
 use embedded_hal::spi::SpiBus;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -62,25 +62,30 @@ async fn main(_spawner: Spawner) {
         programs,
         config,
     );
+    // let spi = Spi::new_blocking(p.SPI0, clk_pin, mosi_pin, miso_pin, config);
 
+    Timer::after_millis(100).await;
     let cs = Output::new(cs_pin, Level::High);
     let spi_dev = unwrap!(ExclusiveDevice::new_no_delay(spi, cs));
 
     let sdcard = SdCard::new(spi_dev, embassy_time::Delay);
-    info!("card type: {}", sdcard.get_card_type());
+    info!("SPI Pio driver finished init");
+
+    let mut config = spi::Config::default();
+    config.frequency = 16_000_000;
+    sdcard.spi(|dev| dev.bus_mut().set_config(&config));
 
     let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sdcard, DummyTimeSource());
+    info!("Got volume manager");
 
-    let mut volume0 = volume_mgr
-        .open_volume(embedded_sdmmc::VolumeIdx(0))
-        .unwrap();
-    info!("Volume 0: {:?}", defmt::Debug2Format(&volume0));
+    let mut volume0 = unwrap!(volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)));
+    info!("Got volume 0");
 
     // Open the root directory (mutably borrows from the volume).
     let mut root_dir = volume0.open_root_dir().unwrap();
 
     root_dir
-        .iterate_dir(|file| info!("File: {}", file.name))
+        .iterate_dir(|file| info!("File: {:?}", str::from_utf8(file.name.base_name()).unwrap()))
         .unwrap();
 
     info!("Done!!!");
@@ -133,23 +138,14 @@ impl<'d, PIO: Instance> PioSpiPrograms<'d, PIO> {
             }
         }
 
-        // assert!(config.phase == Phase::CaptureOnFirstTransition);
-        // assert!(config.polarity == Polarity::IdleLow);
-        // let prg = pio_asm!(
-        //     ".side_set 1",
-        //     "out pins, 1 side 0 [1]", // ; Stall here on empty (sideset proceeds even if
-        //     "in pins, 1  side 1 [1]", // ; instruction stalls, so we stall with SCK low)
-        //     options(max_program_size = 32)  // Optional, defaults to 32
-        // );
-
         Self {
-            // prg: pio.load_program(&prg.program),
             prg: pio.load_program(&assembler.assemble_program()),
         }
     }
 }
 
 pub struct PioSpi<'d, PIO: Instance, const SM: usize> {
+    config: pio::Config<'d, PIO>,
     sm: StateMachine<'d, PIO, SM>,
 }
 
@@ -187,18 +183,23 @@ impl<'d, PIO: Instance, const SM: usize> PioSpi<'d, PIO, SM> {
         sm.set_pin_dirs(Direction::Out, &[&clk, &mosi]);
         sm.set_pin_dirs(Direction::In, &[&miso]);
 
-        Self { sm }
+        Self { sm, config: cfg }
+    }
+
+    pub fn set_config(&mut self, config: &spi::Config) {
+        self.config.clock_divider = ((clk_sys_freq() / config.frequency) as u16).into();
+        self.sm.restart();
     }
 
     fn write_byte(&mut self, byte: u8) {
-        info!("Write {:x}", byte);
+        // info!("Write {:x}", byte);
         self.sm.tx().push((byte as u32) << 24);
     }
 
     fn read_byte(&mut self) -> u8 {
         let read = self.sm.rx().pull();
         let byte = (read & 0xFF) as u8;
-        info!("Read byte: {:02X}", byte);
+        // info!("Read byte: {:02X}", byte);
         byte
     }
 }
