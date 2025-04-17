@@ -2,20 +2,21 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use defmt::info;
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::program::{
-    Assembler, InSource, MovDestination, MovOperation, MovSource, OutDestination, SideSet,
+    Assembler, InSource, MovDestination, MovOperation, MovSource, OutDestination, SideSet, pio_asm,
 };
 use embassy_rp::pio::{
     self, Common, Direction, Instance, InterruptHandler, LoadedProgram, Pio, PioPin, ShiftConfig,
     ShiftDirection, StateMachine,
 };
 use embassy_rp::spi::{self, Error, Phase, Polarity};
+use embassy_time::Timer;
 use embedded_hal::spi::SpiBus;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp};
@@ -35,19 +36,35 @@ async fn main(_spawner: Spawner) {
 
     let mut config = spi::Config::default();
     config.frequency = 400_000;
+
+    info!("spi freq: {}", config.frequency);
+    match config.polarity {
+        Polarity::IdleLow => info!("spi pol: idle low"),
+        Polarity::IdleHigh => info!("spi pol: idle high"),
+    }
+    match config.phase {
+        Phase::CaptureOnFirstTransition => info!("spi pha: capture first"),
+        Phase::CaptureOnSecondTransition => info!("spi pha: capture second"),
+    }
+
+    let clk_pin = p.PIN_2; // SPI Clock
+    let mosi_pin = p.PIN_3; // SPI MOSI (Master Out)
+    let miso_pin = p.PIN_4; // SPI MISO (Master In)
+    let cs_pin = p.PIN_5; // Chip Select
+
     let programs = PioSpiPrograms::new(&mut common, &config);
     let spi = PioSpi::new(
         &mut common,
         sm0,
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
+        clk_pin,
+        mosi_pin,
+        miso_pin,
         programs,
         config,
     );
 
-    let cs = Output::new(p.PIN_5, Level::High);
-    let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+    let cs = Output::new(cs_pin, Level::High);
+    let spi_dev = unwrap!(ExclusiveDevice::new_no_delay(spi, cs));
 
     let sdcard = SdCard::new(spi_dev, embassy_time::Delay);
     info!("card type: {}", sdcard.get_card_type());
@@ -116,7 +133,17 @@ impl<'d, PIO: Instance> PioSpiPrograms<'d, PIO> {
             }
         }
 
+        // assert!(config.phase == Phase::CaptureOnFirstTransition);
+        // assert!(config.polarity == Polarity::IdleLow);
+        // let prg = pio_asm!(
+        //     ".side_set 1",
+        //     "out pins, 1 side 0 [1]", // ; Stall here on empty (sideset proceeds even if
+        //     "in pins, 1  side 1 [1]", // ; instruction stalls, so we stall with SCK low)
+        //     options(max_program_size = 32)  // Optional, defaults to 32
+        // );
+
         Self {
+            // prg: pio.load_program(&prg.program),
             prg: pio.load_program(&assembler.assemble_program()),
         }
     }
@@ -145,22 +172,34 @@ impl<'d, PIO: Instance, const SM: usize> PioSpi<'d, PIO, SM> {
         cfg.set_out_pins(&[&mosi]);
         cfg.set_in_pins(&[&miso]);
         cfg.clock_divider = ((clk_sys_freq() / config.frequency) as u16).into();
-        cfg.shift_in = ShiftConfig {
-            threshold: 32,
-            direction: ShiftDirection::Right,
-            auto_fill: true,
-        };
-        cfg.shift_out = ShiftConfig {
-            threshold: 32,
-            direction: ShiftDirection::Left,
-            auto_fill: true,
-        };
+
+        let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.threshold = 8;
+        shift_cfg.direction = ShiftDirection::Left;
+        shift_cfg.auto_fill = true;
+        cfg.shift_in = shift_cfg;
+        cfg.shift_out = shift_cfg;
+
         sm.set_config(&cfg);
         sm.set_enable(true);
-        sm.set_pin_dirs(Direction::Out, &[&clk]);
+        sm.set_rx_threshold(8);
+        sm.set_tx_threshold(8);
+        sm.set_pin_dirs(Direction::Out, &[&clk, &mosi]);
         sm.set_pin_dirs(Direction::In, &[&miso]);
 
         Self { sm }
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        info!("Write {:x}", byte);
+        self.sm.tx().push((byte as u32) << 24);
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        let read = self.sm.rx().pull();
+        let byte = (read & 0xFF) as u8;
+        info!("Read byte: {:02X}", byte);
+        byte
     }
 }
 
@@ -171,9 +210,9 @@ impl<'d, T: Instance, const SM: usize> embedded_hal::spi::ErrorType for PioSpi<'
 impl<'a, PIO: Instance, const SM: usize> SpiBus<u8> for PioSpi<'a, PIO, SM> {
     fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
         for word in words.iter_mut() {
-            self.write(&[0x00])?;
+            self.write_byte(0x00);
             while self.sm.rx().empty() {}
-            *word = self.sm.rx().pull() as u8;
+            *word = self.read_byte() as u8;
         }
         Ok(())
     }
@@ -182,7 +221,7 @@ impl<'a, PIO: Instance, const SM: usize> SpiBus<u8> for PioSpi<'a, PIO, SM> {
         for &byte in words {
             while self.sm.tx().full() {}
 
-            self.sm.tx().push(byte as u32);
+            self.write_byte(byte);
         }
 
         self.flush()
@@ -191,25 +230,25 @@ impl<'a, PIO: Instance, const SM: usize> SpiBus<u8> for PioSpi<'a, PIO, SM> {
     fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
         for (r, &w) in read.iter_mut().zip(write.iter()) {
             while self.sm.tx().full() {}
-            self.sm.tx().push(w as u32);
+            self.write_byte(w);
 
             while self.sm.rx().empty() {}
-            *r = self.sm.rx().pull() as u8;
+            *r = self.read_byte();
         }
 
-        Ok(())
+        self.flush()
     }
 
     fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
         for word in words.iter_mut() {
             while self.sm.tx().full() {}
-            self.sm.tx().push(*word as u32);
+            self.write_byte(*word);
 
             while self.sm.rx().empty() {}
-            *word = self.sm.rx().pull() as u8;
+            *word = self.read_byte();
         }
 
-        Ok(())
+        self.flush()
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
